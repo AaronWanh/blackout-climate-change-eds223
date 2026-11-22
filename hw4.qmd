@@ -1,0 +1,235 @@
+---
+title: "Homework Assignment 4: Blackout from Extreme Winter Storm"
+author: Aaron Wang
+date: 11-19-2026
+format:
+    pdf:
+        code-fold: false
+
+execute: 
+    message: false
+    warning: false
+---
+
+### Load packages and import data
+```{r}
+library(tidyverse)
+library(stars)
+library(tmap)
+library(sf)
+library(terra)
+library(gt)
+
+night_lights_07_1 <- rast("data/VNP46A1/VNP46A1.A2021038.h08v05.001.2021039064328.tif")
+night_lights_07_2 <- rast("data/VNP46A1/VNP46A1.A2021038.h08v06.001.2021039064329.tif")
+night_lights_16_1 <- rast("data/VNP46A1/VNP46A1.A2021047.h08v05.001.2021048091106.tif")
+night_lights_16_2 <- rast("data/VNP46A1/VNP46A1.A2021047.h08v06.001.2021048091105.tif")
+
+roads <- st_read("data/gis_osm_roads_free_1.gpkg", query = "SELECT * FROM gis_osm_roads_free_1 WHERE fclass='motorway'")
+
+houses <- st_read(
+    "data/gis_osm_buildings_a_free_1.gpkg",
+    query = "SELECT *
+           FROM gis_osm_buildings_a_free_1
+           WHERE (type IS NULL AND name IS NULL)
+           OR type IN ('residential', 'apartments', 'house',
+                       'static_caravan', 'detached')"
+)
+```
+
+### Checking coordinate reference system
+```{r}
+if (crs(night_lights_07_1) == crs(roads)) {
+    print('crs match')
+} else {
+    warning('crs does not match')
+}
+
+if (crs(night_lights_07_1) == crs(night_lights_16_1)) {
+    print('crs match')
+} else {
+    warning('crs does not match')
+}
+```
+
+### Merging raster tiles to respective dates 
+```{r}
+# merge raster tiles 
+night_lights_07 <- merge(night_lights_07_1, night_lights_07_2)
+night_lights_16 <- merge(night_lights_16_1, night_lights_16_2)
+```
+
+## Create Blackout mask
+To identify places that experienced a blackout, you should create a “mask” that indicates for each cell whether or not it experienced a blackout.
+
+* find the change in night lights intensity (presumably) caused by the storm
+    - hint: this will require creating a raster object for each day (2021-02-07 and 2021-02-16)
+* reclassify the difference raster, assuming that any location that experienced a drop of more than 200 nW cm-2sr-1 experienced a blackout
+* assign NA to all locations that experienced a drop of less than 200 nW cm-2sr-1 change
+* vectorize the blackout mask
+hint: use st_as_sf() to convert from a raster to a vector and fix any invalid geometries with st_make_valid()
+* crop (spatially subset) the blackout mask to the Houston area as defined by the following coordinates:
+(-96.5, 29), (-96.5, 30.5), (-94.5, 30.5), (-94.5, 29)
+* re-project the cropped blackout dataset to EPSG:3083 (NAD83 / Texas Centric Albers Equal Area)
+
+```{r}
+# calculate the change in night light intensity
+light_diff <- night_lights_07 - night_lights_16
+
+# reclassify so that location > 200 nW is 1 and location < 200 nW is NA
+rcl_light <- matrix(c(-Inf, 200, NA,
+                      200, Inf, 1), ncol = 3, byrow = TRUE)
+
+masked_blackout <- classify(light_diff, rcl_light, include.lowest = TRUE)
+
+# longitude: -96.5 to -94.5 
+# latitude: 29 to 30.5
+blackout_houston <- crop(masked_blackout, ext(-96.5, -94.5, 29, 30.5))
+
+# vectorize and reproject the masked raster
+blackout_houston <- st_as_stars(blackout_houston) |> 
+    st_as_sf(merge = TRUE, na.rm = TRUE) |> 
+    st_transform(3083) |> 
+    st_make_valid()
+```
+
+### A set of maps comparing night light intensities before and after the first two storms
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| out-width: "100%"
+#| fig-align: center
+
+houston_ext <- ext(-96.5, -94.5, 29, 30.5)
+
+# crop the vectorized data to houston
+nl_07 <- crop(night_lights_07, houston_ext)
+nl_16 <- crop(night_lights_16, houston_ext)
+
+nl_both <- c(nl_07, nl_16)
+names(nl_both) <- c("Feb 7, 2021 (before storms)", "Feb 16, 2021 (after storms)")
+
+light_breaks = c(0, 25, 50, 100, 200, 500, 1000, 5000, Inf)
+
+# graph the change in radiance between 02-07 and 02-16
+tm_shape(nl_both) +
+    tm_raster(
+        col.scale = tm_scale_intervals(breaks = light_breaks, values = "viridis"),
+        col.free = FALSE, # makes it so that both maps share a legend
+        col.legend = tm_legend(
+        title = "Radiance (nW cm^-2 sr^-1)",
+        orientation = "landscape",
+        position = tm_pos_out("center", "bottom"))
+    ) +
+    tm_facets(ncol = 2) +    
+    tm_title("Night light intensities in Houston before and after storm") +
+    tm_layout(
+        panel.label.size = 1,
+        frame = FALSE,
+        inner.margins = 0
+  )
+```
+
+## Exclude highways from the cropped blackout mask
+Highways may have experienced changes in their night light intensities that are unrelated to the storm. Therefore, you should excluded any locations within 200 meters of all highways in the Houston area.
+
+* identify areas within 200m of all highways
+    - hint: you may need to use st_union
+* find areas that experienced blackouts that are further than 200m from a highway
+
+```{r}
+if (crs(blackout_houston) == crs(roads)) {
+    print('crs match')
+} else {
+    warning('crs does not match')
+}
+```
+
+```{r}
+roads <- st_transform(roads, 3083)
+```
+
+```{r}
+# create a buffer of 200 meters from the highway
+roads_buffer <- st_buffer(roads, dist = 200)
+roads_buffer <- st_union(roads_buffer)
+
+# exclude houses within buffer range
+blackout_no_highways <- st_difference(blackout_houston, roads_buffer)
+```
+
+## Identify the number of homes likely impacted by blackouts
+* identify homes that overlap with areas that experienced blackouts
+
+
+```{r}
+if (crs(blackout_no_highways) == crs(houses)) {
+    print('crs match')
+} else {
+    warning('crs does not match')
+}
+```
+
+```{r}
+houses = st_transform(houses, 3083)
+```
+
+```{r}
+# filter houses only inside blackout region
+blackout_houses <- st_filter(
+    houses, 
+    blackout_no_highways,
+    .predicate = st_intersects
+)
+
+total_blackout_houses <- nrow(blackout_houses)
+```
+```{r}
+# table that shows the number of homes affected by power outages. 
+tibble(
+    metric = "Homes that lost power",
+    count  = total_blackout_houses
+) |>
+gt() |>
+    tab_header(
+        title    = "Houston Blackout Impact",
+        subtitle = "February 2021 winter storms"
+    ) |>
+    fmt_number(columns = count, decimals = 0) |>
+    cols_label(metric = "", count = "Number of homes")
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+#| out-width: "100%"
+#| fig-align: center
+
+# graph the region in which homes experienced blackouts from the storm
+tm_basemap("OpenStreetMap") +
+    tm_shape(blackout_houses) +
+    tm_fill("#B30000") +
+    tm_borders(
+        col = "darkred",
+        lwd = 0.2
+    ) +
+    tm_add_legend(
+        type = "fill",
+        col = "#B30000",
+        labels = "Homes potentially affected"
+    ) +
+    tm_title("Blackouts in Houston") +
+    tm_compass(position = c("bottom", "left")) +
+    tm_scalebar(position = c("bottom", "right"), size = 0.6)
+```
+
+## Interpretation: 
+Based on our results, the number of houses affected by the extreme weather storm was substantial. Over 150,000 thousands homes experienced blackouts not including those who lived near 200 m of highways who may have experienced blackouts. The overall radiance levels decreased around Houston and intersected with homes that experienced blackouts.The cloud coverage was a major limitation to this analysis because we were only able to compare two days with relative clear skies. Using a fixed 200 nW cm-2 sr -1 radiance drop can be limiting since homes that may be affected by the blackout but to a less substantial extent are excluded. 
+
+
+## Data Citation: 
+| Data | Citation | Link |
+|:---|:---|:---|
+| VNP46A1 | VIIRS/NPP daily gridded day night band 500m linear lat lon grid night (VNP46A1), version 1 [Data set]. *NASA Level-1 and Atmosphere Archive and Distribution System Distributed Active Archive Center (LAADS DAAC)* | [NOAA Coral Reef Watch](https://coralreefwatch.noaa.gov/product/5km/index_5km_ssta.php) |
+| Texas Roads | OpenStreetMap data extracts: Texas roads [Data set]. *Geofabrik (OpenStreetMap)* | [Geofabrik](https://download.geofabrik.de/) |
+| Texas Homes | OpenStreetMap data extracts: Texas buildings [Data set]. *Geofabrik (OpenStreetMap)* | [Geofabrik](https://download.geofabrik.de/) |
